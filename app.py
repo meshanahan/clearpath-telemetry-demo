@@ -84,35 +84,42 @@ def authorize(key):
 def trigger(scenario:str,x_demo_key:str|None=Header(default=None)):
  authorize(x_demo_key)
  if scenario not in ("ats-drift","provider-401","employer-delay","telemetry-noise"): raise HTTPException(404,"Unknown scenario")
+ changed_orders=None
  with LATENCY.labels(scenario).time():
   with LOCK:
    with connect() as c:
     if scenario=="ats-drift":
-     c.execute("UPDATE orders SET ats_status='PENDING',updated_at=? WHERE id IN (SELECT id FROM orders WHERE internal_status='COMPLETED' ORDER BY id LIMIT 16)",(time.time(),))
-     WEBHOOK_ERRORS.labels("semantic_ack_mismatch").inc(16)
+     result=c.execute("UPDATE orders SET ats_status='PENDING',updated_at=? WHERE id IN (SELECT id FROM orders WHERE internal_status='COMPLETED' AND ats_status!='PENDING' ORDER BY id LIMIT 16)",(time.time(),))
+     changed_orders=result.rowcount
+     if changed_orders:
+      WEBHOOK_ERRORS.labels("semantic_ack_mismatch").inc(changed_orders)
     elif scenario=="employer-delay":
      c.execute("UPDATE orders SET internal_status='AWAITING_EXTERNAL',verification_stage='EMPLOYER_RESPONSE',updated_at=? WHERE id IN (SELECT id FROM orders WHERE internal_status='IN_PROGRESS' ORDER BY id LIMIT 18)",(time.time(),))
     elif scenario=="provider-401": PROVIDER_ERRORS.labels("token_expired").inc(8)
     else: WEBHOOK_ERRORS.labels("non_customer_telemetry_warning").inc(3)
    refresh()
-  SCENARIOS.labels(scenario).inc()
-  if os.getenv("SENTRY_DSN"):
+  if scenario!="ats-drift" or changed_orders:
+   SCENARIOS.labels(scenario).inc()
+  if os.getenv("SENTRY_DSN") and (scenario!="ats-drift" or changed_orders):
    import sentry_sdk
    with sentry_sdk.push_scope() as scope:
     scope.set_tag("demo.synthetic", "true")
     scope.set_tag("clearpath.scenario", scenario)
-    scope.set_context("clearpath_incident", {"scenario":scenario,"synthetic":True,"summary":summary()})
+    invocation_id=secrets.token_hex(8)
+    scope.set_context("clearpath_incident", {"scenario":scenario,"synthetic":True,"invocation_id":invocation_id,"changed_orders":changed_orders,"summary":summary()})
     if scenario=="provider-401":
      try:
       raise RuntimeError("Synthetic provider token rejected: HTTP 401 (demo injection)")
      except RuntimeError as error:
       sentry_sdk.capture_exception(error)
     elif scenario=="ats-drift":
-     sentry_sdk.capture_message("Synthetic ATS webhook semantic ACK mismatch: 16 orders", level="error")
+     sentry_sdk.capture_message(f"Synthetic ATS webhook semantic ACK mismatch: {changed_orders} orders", level="error")
     elif scenario=="employer-delay":
      sentry_sdk.capture_message("Synthetic employer-response backlog: external dependency", level="warning")
     else:
      sentry_sdk.capture_message("Synthetic non-customer telemetry warning", level="warning")
+ if scenario=="ats-drift":
+  return {"scenario":scenario,"result":"synthetic scenario triggered" if changed_orders else "no-op","changed_orders":changed_orders,"no_op":changed_orders==0,"summary":summary()}
  return {"scenario":scenario,"result":"synthetic scenario triggered","summary":summary()}
 
 @app.post("/demo/reset")
