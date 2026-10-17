@@ -1,5 +1,6 @@
 """ClearPath synthetic order telemetry API. No real applicant data."""
 import os, sqlite3, time, secrets
+import logging
 from pathlib import Path
 from threading import RLock
 from fastapi import FastAPI, Header, HTTPException
@@ -95,6 +96,23 @@ def trigger(scenario:str,x_demo_key:str|None=Header(default=None)):
     else: WEBHOOK_ERRORS.labels("non_customer_telemetry_warning").inc(3)
    refresh()
   SCENARIOS.labels(scenario).inc()
+  if os.getenv("SENTRY_DSN"):
+   import sentry_sdk
+   with sentry_sdk.push_scope() as scope:
+    scope.set_tag("demo.synthetic", "true")
+    scope.set_tag("clearpath.scenario", scenario)
+    scope.set_context("clearpath_incident", {"scenario":scenario,"synthetic":True,"summary":summary()})
+    if scenario=="provider-401":
+     try:
+      raise RuntimeError("Synthetic provider token rejected: HTTP 401 (demo injection)")
+     except RuntimeError as error:
+      sentry_sdk.capture_exception(error)
+    elif scenario=="ats-drift":
+     sentry_sdk.capture_message("Synthetic ATS webhook semantic ACK mismatch: 16 orders", level="error")
+    elif scenario=="employer-delay":
+     sentry_sdk.capture_message("Synthetic employer-response backlog: external dependency", level="warning")
+    else:
+     sentry_sdk.capture_message("Synthetic non-customer telemetry warning", level="warning")
  return {"scenario":scenario,"result":"synthetic scenario triggered","summary":summary()}
 
 @app.post("/demo/reset")
